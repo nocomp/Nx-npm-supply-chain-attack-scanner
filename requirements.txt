@@ -1,2 +1,4 @@
 requests>=2.31.0
 PyYAML>=6.0.2
+colorama>=0.4.6
+dnspython>=2.6.1
