@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 Supply-chain NPM Scanner – Web (HTTP) batch & Local (disks/servers)
-- Web: single URL, file of URLs, or domain (auto subdomain enumeration via crt.sh)
+- Web: single URL, file of URLs, or domain (subdomain discovery via crt.sh and/or DNS brute-force with --ns)
 - Local: one or more paths
 - Parallel scanning for web targets
-- Console colors for quick triage
-- Aggregated HTML + JSON report (web targets) with hostname/dir labels for local
+- Console colors for quick triage (compromised/suspicious/clean)
+- Aggregated HTML + JSON report
 
 Report filenames:
   Web (single):   report_{WEBHOST}__web_{TS}.html/json
@@ -15,7 +15,7 @@ Report filenames:
   Local (multi):  report_{HOSTNAME}__multi_{TS}.html/json
 """
 
-import os, re, sys, json, datetime, hashlib, queue, argparse, socket
+import os, re, sys, json, datetime, hashlib, queue, argparse, socket, random, string
 from html import escape
 from urllib.parse import urlparse, urljoin
 
@@ -41,6 +41,13 @@ except Exception:
     class _F: RESET=""; RED=""; GREEN=""; YELLOW=""; CYAN=""; MAGENTA=""; BLUE=""
     class _S: RESET_ALL=""
     Fore, Style = _F(), _S()
+
+try:
+    import dns.resolver
+    import dns.exception
+    HAVE_DNSPYTHON = True
+except Exception:
+    HAVE_DNSPYTHON = False
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -108,6 +115,17 @@ JS_EXTS = (".js", ".mjs", ".map")
 LOCAL_IGNORE_DIRS = {
     ".git", ".svn", ".hg", "node_modules/.cache", "dist", "build", ".next", ".nuxt", ".svelte-kit"
 }
+
+# Default DNS brute-force wordlist (small, you can pass your own with --dns-wordlist)
+DEFAULT_WORDS = [
+    "www","app","apps","api","api1","api2","admin","portal","intra","intranet",
+    "dev","test","stage","staging","preprod","prod","cdn","static","assets","js",
+    "mail","smtp","imap","auth","sso","login","dashboard","console","kibana","grafana",
+    "jenkins","git","gitlab","registry","nexus","harbor","vault","consul","nomad",
+    "k8s","kubernetes","argocd","argo","helm","prometheus","alertmanager","jaeger",
+    "mq","rabbit","kafka","zookeeper","redis","memcached","db","postgres","mysql","mariadb",
+    "files","storage","minio","s3","backup","proxy","gateway","edge","bff","frontend","backend",
+]
 
 OUTPUT_DIR = os.path.abspath("./scanner_output")
 WEB_DUMP_DIR = os.path.join(OUTPUT_DIR, "web_dumps")
@@ -313,9 +331,6 @@ def crawl_and_collect(base_url: str):
 # ========================
 
 def enumerate_subdomains_crtsh(domain: str, limit: int = None):
-    """
-    Uses crt.sh JSON output to enumerate subdomains of the given domain.
-    """
     url = f"https://crt.sh/?q=%25.{domain}&output=json"
     subs = set()
     try:
@@ -335,6 +350,74 @@ def enumerate_subdomains_crtsh(domain: str, limit: int = None):
         out = out[:limit]
     return out
 
+def dns_resolver_for(ns_server: str, timeout: float = 4.0):
+    if not HAVE_DNSPYTHON:
+        raise RuntimeError("dnspython not installed. pip install dnspython")
+    res = dns.resolver.Resolver(configure=True)
+    res.nameservers = [ns_server]
+    res.lifetime = timeout
+    res.timeout = timeout
+    return res
+
+def dns_has_wildcard(domain: str, resolver) -> bool:
+    # Random label test: if it resolves, likely wildcard
+    label = ''.join(random.choice(string.ascii_lowercase) for _ in range(16))
+    fqdn = f"{label}.{domain}"
+    try:
+        resolver.resolve(fqdn, "A")
+        return True
+    except dns.resolver.NXDOMAIN:
+        return False
+    except dns.exception.DNSException:
+        return False
+
+def try_resolve_any(fqdn: str, resolver) -> bool:
+    for rrtype in ("A", "AAAA", "CNAME"):
+        try:
+            resolver.resolve(fqdn, rrtype)
+            return True
+        except dns.resolver.NXDOMAIN:
+            return False
+        except dns.exception.DNSException:
+            continue
+    return False
+
+def load_wordlist(path: str):
+    if not path:
+        return [w for w in DEFAULT_WORDS]
+    txt = read_text(path, "")
+    words = [l.strip() for l in txt.splitlines() if l.strip() and not l.strip().startswith("#")]
+    return words or [w for w in DEFAULT_WORDS]
+
+def dns_bruteforce_subdomains(domain: str, ns_server: str, wordlist_path: str = None, workers: int = 16, limit: int = None):
+    words = load_wordlist(wordlist_path)
+    if limit:
+        words = words[:limit]
+    try:
+        res = dns_resolver_for(ns_server)
+    except Exception:
+        return [], {"error": f"DNS resolver init failed for {ns_server}"}
+    wildcard = dns_has_wildcard(domain, res)
+    found = set()
+    summary = {"ns": ns_server, "wildcard": wildcard}
+
+    def _task(label):
+        fqdn = f"{label}.{domain}"
+        ok = try_resolve_any(fqdn, res)
+        return fqdn if ok else None
+
+    with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
+        futmap = {pool.submit(_task, w): w for w in words}
+        for fut in as_completed(futmap):
+            try:
+                fqdn = fut.result()
+            except Exception:
+                fqdn = None
+            if fqdn:
+                found.add(fqdn.lower().strip("."))
+
+    return sorted(found), summary
+
 def normalize_url(u: str, default_scheme="https"):
     u = u.strip()
     if not u:
@@ -343,11 +426,17 @@ def normalize_url(u: str, default_scheme="https"):
         u = f"{default_scheme}://{u}"
     return u
 
+def summarize_web_scan(scan):
+    bundles = suspicious = compromised = obx = obr = 0
+    for j in scan.get("js_files", []):
+        if "size" in j: bundles += 1
+        if j.get("patterns"): suspicious += 1
+        if j.get("bad_version_match"): compromised += 1
+        if j.get("obfuscation_exact"): obx += 1
+        if j.get("obfuscation_relaxed"): obr += 1
+    return {"bundles": bundles, "suspicious": suspicious, "compromised": compromised, "obfus_exact": obx, "obfus_relax": obr}
+
 def scan_many_web(urls, workers=6):
-    """
-    Scan multiple web targets in parallel.
-    Returns a list of individual web_scan dicts.
-    """
     scans = []
     with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
         futmap = {pool.submit(crawl_and_collect, url): url for url in urls}
@@ -371,16 +460,6 @@ def scan_many_web(urls, workers=6):
             else:
                 print(line)
     return scans
-
-def summarize_web_scan(scan):
-    bundles = suspicious = compromised = obx = obr = 0
-    for j in scan.get("js_files", []):
-        if "size" in j: bundles += 1
-        if j.get("patterns"): suspicious += 1
-        if j.get("bad_version_match"): compromised += 1
-        if j.get("obfuscation_exact"): obx += 1
-        if j.get("obfuscation_relaxed"): obr += 1
-    return {"bundles": bundles, "suspicious": suspicious, "compromised": compromised, "obfus_exact": obx, "obfus_relax": obr}
 
 # ========================
 # Local scan
@@ -425,7 +504,6 @@ def scan_local_paths(paths):
                         if lf == "package-lock.json":
                             with open(p, "r", encoding="utf-8", errors="replace") as f:
                                 pl = json.load(f)
-
                             def walk(obj):
                                 if isinstance(obj, dict):
                                     nm = obj.get("name")
@@ -474,10 +552,6 @@ def scan_local_paths(paths):
 # ========================
 
 def build_report(web_scans, local_scan, out_html_path, out_json_path):
-    """
-    web_scans: list of web scan dicts (can be empty)
-    local_scan: dict or None
-    """
     ts = now_iso()
     summary = {
         "generated_at": ts,
@@ -651,10 +725,14 @@ def main():
     g = pw.add_mutually_exclusive_group(required=True)
     g.add_argument("--url", help="Single starting URL, e.g. https://example.com/")
     g.add_argument("--file", help="Path to a file with one URL per line")
-    g.add_argument("--domain", help="Root domain to enumerate subdomains via crt.sh (e.g., example.com)")
-    pw.add_argument("--scheme", default="https", help="Default scheme when using --domain or raw hosts in --file (default: https)")
-    pw.add_argument("--limit", type=int, default=None, help="Limit number of subdomains (with --domain)")
+    g.add_argument("--domain", help="Root domain to enumerate subdomains via crt.sh and/or DNS")
+    pw.add_argument("--ns", help="Optional DNS server IP for intranet discovery (DNS brute-force)")
+    pw.add_argument("--dns-wordlist", help="Wordlist file (one label per line) for DNS brute-force")
+    pw.add_argument("--dns-limit", type=int, default=None, help="Limit labels tested in DNS brute-force")
+    pw.add_argument("--scheme", default="https", help="Default scheme when building URLs from hosts (default: https)")
+    pw.add_argument("--limit", type=int, default=None, help="Limit number of subdomains from crt.sh")
     pw.add_argument("--workers", type=int, default=6, help="Parallel workers for web scans")
+    pw.add_argument("--dns-workers", type=int, default=16, help="Parallel workers for DNS brute-force")
     pw.add_argument("--report-prefix", default=None, help="Override report prefix")
 
     # Local mode
@@ -670,18 +748,38 @@ def main():
 
     if args.mode == "web":
         targets = []
+
         if args.url:
             targets = [normalize_url(args.url)]
             prefix = args.report_prefix or derive_report_prefix_web_single(targets[0])
+
         elif args.file:
             raw = [l.strip() for l in read_text(args.file, "").splitlines() if l.strip()]
             targets = [normalize_url(x, default_scheme=args.scheme) for x in raw]
             targets = [t for t in targets if t]
             prefix = args.report_prefix or derive_report_prefix_web_batch(targets)
+
         else:  # --domain
-            subs = enumerate_subdomains_crtsh(args.domain, limit=args.limit)
-            # include root domain as well
-            hosts = sorted(set([args.domain] + subs))
+            # 1) CT-based enumeration
+            subs_ct = enumerate_subdomains_crtsh(args.domain, limit=args.limit) if args.domain else []
+            hosts = set(subs_ct + ([args.domain] if args.domain else []))
+
+            # 2) Optional DNS brute-force via --ns
+            if args.ns:
+                if not HAVE_DNSPYTHON:
+                    print("[!] dnspython is required for --ns. Install with: pip install dnspython")
+                    sys.exit(2)
+                subs_dns, summary = dns_bruteforce_subdomains(
+                    args.domain, args.ns, wordlist_path=args.dns_wordlist,
+                    workers=args.dns_workers, limit=args.dns_limit
+                )
+                if COLOR:
+                    print(Fore.CYAN + f"[*] DNS brute-force via {args.ns} → {len(subs_dns)} found"
+                          + (f" (wildcard DNS detected)" if summary.get('wildcard') else "")
+                          + Style.RESET_ALL)
+                hosts.update(subs_dns)
+
+            hosts = sorted(set(h for h in hosts if h))
             targets = [normalize_url(h, default_scheme=args.scheme) for h in hosts]
             prefix = args.report_prefix or derive_report_prefix_web_batch(targets)
 
