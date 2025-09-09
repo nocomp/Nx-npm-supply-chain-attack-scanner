@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Supply-chain NPM Scanner – Web (HTTP) & Local (disks/servers)
-- Web or Local scan, generates an HTML + JSON report per run
-- Report filenames now include the server/host and a directory label for remediation clarity:
-  * Web:  report_{WEBHOST}__web_{TS}.html/json
-  * Local (single path): report_{HOSTNAME}__{BASENAME}_{TS}.html/json
-  * Local (multiple):    report_{HOSTNAME}__multi_{TS}.html/json
+Supply-chain NPM Scanner – Web (HTTP) batch & Local (disks/servers)
+- Web: single URL, file of URLs, or domain (auto subdomain enumeration via crt.sh)
+- Local: one or more paths
+- Parallel scanning for web targets
+- Console colors for quick triage
+- Aggregated HTML + JSON report (web targets) with hostname/dir labels for local
+
+Report filenames:
+  Web (single):   report_{WEBHOST}__web_{TS}.html/json
+  Web (multiple): report_{FIRSTHOST}+{N-1}__webbatch_{TS}.html/json
+  Local (1 path): report_{HOSTNAME}__{DIRNAME}_{TS}.html/json
+  Local (multi):  report_{HOSTNAME}__multi_{TS}.html/json
 """
 
 import os, re, sys, json, datetime, hashlib, queue, argparse, socket
@@ -25,6 +31,18 @@ try:
     HAVE_YAML = True
 except Exception:
     HAVE_YAML = False
+
+try:
+    from colorama import init as colorama_init, Fore, Style
+    COLOR = True
+    colorama_init(autoreset=True)
+except Exception:
+    COLOR = False
+    class _F: RESET=""; RED=""; GREEN=""; YELLOW=""; CYAN=""; MAGENTA=""; BLUE=""
+    class _S: RESET_ALL=""
+    Fore, Style = _F(), _S()
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ========================
 # Configuration / IOC / Patterns
@@ -68,7 +86,7 @@ SUSPICIOUS_REGEX = [
     r"_0x[0-9a-fA-F]{4,}\(",
 ]
 
-# Exact & relaxed obfuscation snippet from the incident
+# Exact & relaxed obfuscation snippet (verbatim + regex)
 OBFUSCATION_SNIPPET_EXACT = (
     "const _0x112fa8=_0x180f;(function(_0x13c8b9,_0_35f660){const _0x15b386=_0x180f,"
 )
@@ -180,19 +198,16 @@ def extract_version_hints(text: str, package_names):
     return sorted([(n, v) for (n, v) in uniq.keys()])
 
 def sanitize_label(s: str, maxlen: int = 40) -> str:
-    """Make a filesystem/filename-friendly short label."""
     if not s:
         return "root"
-    # Keep alnum and dash; replace others with '-'
     label = re.sub(r"[^A-Za-z0-9\-]+", "-", s)
-    # Collapse multiple dashes
     label = re.sub(r"-{2,}", "-", label).strip("-")
     if len(label) > maxlen:
         label = label[:maxlen].rstrip("-")
     return label or "root"
 
 # ========================
-# Web scan
+# Web scan (single)
 # ========================
 
 def crawl_and_collect(base_url: str):
@@ -217,28 +232,26 @@ def crawl_and_collect(base_url: str):
     to_visit.put(base_url)
     seen_pages.add(base_url)
 
-    # first page scripts
+    # scripts on landing page
     for s in guess_scripts_from_html(base_html):
         full = safe_join(base_url, s)
         if full and full.endswith(JS_EXTS):
             seen_js.add(full)
 
-    # BFS limited crawl
+    # BFS crawl (same-origin)
     while not to_visit.empty() and len(results["pages_crawled"]) < MAX_PAGE_CRAWL:
         url = to_visit.get()
-        if url != base_url:  # already added base page above
+        if url != base_url:
             try:
                 r = fetch(url, session)
                 html = r.text
                 results["pages_crawled"].append({"url": url, "status": r.status_code, "size": len(html)})
 
-                # scripts
                 for s in guess_scripts_from_html(html):
                     full = safe_join(url, s)
                     if full and full.endswith(JS_EXTS) and len(seen_js) < MAX_JS_PER_SITE:
                         seen_js.add(full)
 
-                # follow internal links (to discover more pages importing scripts)
                 for m in re.finditer(r'href=["\']([^"\']+)["\']', html, re.IGNORECASE):
                     link = m.group(1)
                     full = safe_join(url, link)
@@ -251,11 +264,10 @@ def crawl_and_collect(base_url: str):
                         if full not in seen_pages and len(seen_pages) < MAX_PAGE_CRAWL:
                             seen_pages.add(full)
                             to_visit.put(full)
-
             except Exception as e:
                 results["pages_crawled"].append({"url": url, "error": str(e)})
 
-    # Download & analyze JS/MJS/MAP
+    # Download & analyze
     dumped = []
     for js_url in sorted(seen_js):
         try:
@@ -273,10 +285,8 @@ def crawl_and_collect(base_url: str):
 
             keywords = detect_keywords(text, PACKAGE_KEYWORDS)
             suspicious = detect_patterns(text, SUSPICIOUS_REGEX)
-
             exact_snippet = OBFUSCATION_SNIPPET_EXACT in text
             relaxed_hit = bool(re.search(OBFUSCATION_SNIPPET_REGEX, text))
-
             versions = extract_version_hints(text, BAD_PACKAGES.keys())
             bad_hits = [(n, v) for (n, v) in versions if BAD_PACKAGES.get(n) == v]
 
@@ -299,6 +309,80 @@ def crawl_and_collect(base_url: str):
     return results
 
 # ========================
+# Web batch helpers
+# ========================
+
+def enumerate_subdomains_crtsh(domain: str, limit: int = None):
+    """
+    Uses crt.sh JSON output to enumerate subdomains of the given domain.
+    """
+    url = f"https://crt.sh/?q=%25.{domain}&output=json"
+    subs = set()
+    try:
+        r = requests.get(url, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        for entry in data:
+            name_value = entry.get("name_value", "")
+            for row in name_value.split("\n"):
+                row = row.strip().lower().strip(".")
+                if row.endswith("." + domain) or row == domain:
+                    subs.add(row)
+    except Exception:
+        pass
+    out = sorted(subs)
+    if limit and len(out) > limit:
+        out = out[:limit]
+    return out
+
+def normalize_url(u: str, default_scheme="https"):
+    u = u.strip()
+    if not u:
+        return None
+    if not u.startswith(("http://", "https://")):
+        u = f"{default_scheme}://{u}"
+    return u
+
+def scan_many_web(urls, workers=6):
+    """
+    Scan multiple web targets in parallel.
+    Returns a list of individual web_scan dicts.
+    """
+    scans = []
+    with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
+        futmap = {pool.submit(crawl_and_collect, url): url for url in urls}
+        for fut in as_completed(futmap):
+            url = futmap[fut]
+            try:
+                res = fut.result()
+            except Exception as e:
+                res = {"base_url": url, "pages_crawled": [{"url": url, "error": str(e)}], "js_files": []}
+            scans.append(res)
+            # Console triage per target
+            kpi = summarize_web_scan(res)
+            line = f"• {url} — bundles:{kpi['bundles']} suspicious:{kpi['suspicious']} compromised:{kpi['compromised']} obfus(exact/relax):{kpi['obfus_exact']}/{kpi['obfus_relax']}"
+            if COLOR:
+                if kpi["compromised"] > 0:
+                    print(Fore.RED + line + Style.RESET_ALL)
+                elif kpi["suspicious"] > 0 or kpi["obfus_exact"] or kpi["obfus_relax"]:
+                    print(Fore.YELLOW + line + Style.RESET_ALL)
+                else:
+                    print(Fore.GREEN + line + Style.RESET_ALL)
+            else:
+                print(line)
+    return scans
+
+def summarize_web_scan(scan):
+    bundles = suspicious = compromised = obx = obr = 0
+    for j in scan.get("js_files", []):
+        if "size" in j: bundles += 1
+        if j.get("patterns"): suspicious += 1
+        if j.get("bad_version_match"): compromised += 1
+        if j.get("obfuscation_exact"): obx += 1
+        if j.get("obfuscation_relaxed"): obr += 1
+    return {"bundles": bundles, "suspicious": suspicious, "compromised": compromised, "obfus_exact": obx, "obfus_relax": obr}
+
+# ========================
 # Local scan
 # ========================
 
@@ -318,12 +402,10 @@ def scan_local_paths(paths):
     for root in paths:
         root = os.path.abspath(root)
         for dirpath, dirnames, filenames in os.walk(root):
-            # ignore noisy dirs
             for ex in list(dirnames):
                 if ex in LOCAL_IGNORE_DIRS:
                     dirnames.remove(ex)
 
-            # node_modules package.json
             if "package.json" in filenames and "node_modules" in dirpath:
                 pkg_path = os.path.join(dirpath, "package.json")
                 try:
@@ -336,7 +418,6 @@ def scan_local_paths(paths):
                 except Exception as e:
                     results["errors"].append(f"{pkg_path}: {e}")
 
-            # lockfiles
             for lf in ("package-lock.json", "yarn.lock", "pnpm-lock.yaml"):
                 if lf in filenames:
                     p = os.path.join(dirpath, lf)
@@ -356,7 +437,6 @@ def scan_local_paths(paths):
                                 elif isinstance(obj, list):
                                     for v in obj:
                                         walk(v)
-
                             walk(pl)
 
                         elif lf == "yarn.lock":
@@ -384,7 +464,6 @@ def scan_local_paths(paths):
                                             check_pkg(name, ver, p, "pnpm-lock.yaml")
                             else:
                                 results["errors"].append(f"{p}: PyYAML missing (pip install pyyaml)")
-
                     except Exception as e:
                         results["errors"].append(f"{p}: {e}")
 
@@ -394,36 +473,31 @@ def scan_local_paths(paths):
 # Reporting
 # ========================
 
-def build_report(web_scan, local_scan, out_html_path, out_json_path):
+def build_report(web_scans, local_scan, out_html_path, out_json_path):
+    """
+    web_scans: list of web scan dicts (can be empty)
+    local_scan: dict or None
+    """
     ts = now_iso()
     summary = {
         "generated_at": ts,
         "ioc_info": IOC_INFO,
         "bad_packages": BAD_PACKAGES,
-        "web_scan": web_scan,
+        "web_scans": web_scans,
         "local_scan": local_scan,
     }
     write_json(out_json_path, summary)
 
-    # counts
-    total_js = 0
-    bad_web = 0
-    susp_web = 0
-    exact_obs = 0
-    relaxed_obs = 0
-    if web_scan:
-        for j in web_scan.get("js_files", []):
-            if "size" in j:
-                total_js += 1
-            if j.get("bad_version_match"):
-                bad_web += 1
-            if j.get("patterns"):
-                susp_web += 1
-            if j.get("obfuscation_exact"):
-                exact_obs += 1
-            if j.get("obfuscation_relaxed"):
-                relaxed_obs += 1
-
+    # aggregate KPIs
+    tot_web = len(web_scans or [])
+    total_bundles = total_susp = total_comp = total_obx = total_obr = 0
+    for w in (web_scans or []):
+        k = summarize_web_scan(w)
+        total_bundles += k["bundles"]
+        total_susp += k["suspicious"]
+        total_comp += k["compromised"]
+        total_obx += k["obfus_exact"]
+        total_obr += k["obfus_relax"]
     total_local = len(local_scan.get("packages_hits", [])) if local_scan else 0
 
     css = """
@@ -431,7 +505,7 @@ def build_report(web_scan, local_scan, out_html_path, out_json_path):
     *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font-family:Inter,Roboto,Arial,sans-serif}
     header{padding:18px 20px;border-bottom:1px solid var(--line)}
     h1{font-size:22px;margin:0 0 6px}.sub{color:var(--muted);font-size:13px}
-    .kpis{display:grid;grid-template-columns:repeat(5,minmax(160px,1fr));gap:12px;padding:16px}
+    .kpis{display:grid;grid-template-columns:repeat(6,minmax(140px,1fr));gap:12px;padding:16px}
     .kpi{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px}
     .kpi .n{font-size:28px;font-weight:700}.kpi .l{color:var(--muted);font-size:12px;margin-top:2px}
     section{padding:10px 16px 20px}
@@ -452,13 +526,12 @@ def build_report(web_scan, local_scan, out_html_path, out_json_path):
 
     # KPIs
     html.append("<div class='kpis'>")
-    html.append(f"<div class='kpi'><div class='n'>{1 if web_scan else 0}</div><div class='l'>Web targets</div></div>")
-    html.append(f"<div class='kpi'><div class='n'>{total_js}</div><div class='l'>Bundles analyzed</div></div>")
-    html.append(f"<div class='kpi'><div class='n warn'>{susp_web}</div><div class='l'>Suspicious patterns</div></div>")
-    html.append(f"<div class='kpi'><div class='n danger'>{bad_web}</div><div class='l'>Compromised versions (web)</div></div>")
-    html.append(f"<div class='kpi'><div class='n'>{exact_obs}/{relaxed_obs}</div><div class='l'>Obfuscation snippet (exact/relaxed)</div></div>")
-    html.append(f"<div class='kpi'><div class='n'>{1 if local_scan else 0}</div><div class='l'>Local targets</div></div>")
-    html.append(f"<div class='kpi'><div class='n danger'>{total_local}</div><div class='l'>Compromised versions (local)</div></div>")
+    html.append(f"<div class='kpi'><div class='n'>{tot_web}</div><div class='l'>Web targets</div></div>")
+    html.append(f"<div class='kpi'><div class='n'>{total_bundles}</div><div class='l'>Bundles analyzed</div></div>")
+    html.append(f"<div class='kpi'><div class='n warn'>{total_susp}</div><div class='l'>Suspicious patterns</div></div>")
+    html.append(f"<div class='kpi'><div class='n danger'>{total_comp}</div><div class='l'>Compromised (web)</div></div>")
+    html.append(f"<div class='kpi'><div class='n'>{total_obx}/{total_obr}</div><div class='l'>Obfuscation (exact/relax)</div></div>")
+    html.append(f"<div class='kpi'><div class='n danger'>{total_local}</div><div class='l'>Compromised (local)</div></div>")
     html.append("</div>")
 
     # IOC reference
@@ -475,41 +548,44 @@ def build_report(web_scan, local_scan, out_html_path, out_json_path):
         html.append(f"<tr><td><code>{escape(n)}</code></td><td class='danger'><code>{escape(v)}</code></td></tr>")
     html.append("</tbody></table></div></section>")
 
-    # Web details
-    html.append("<section><h2>Web Scan</h2>")
-    if not web_scan:
-        html.append("<div class='card ok'>No web target scanned.</div>")
+    # Web details (per target)
+    html.append("<section><h2>Web Scans</h2>")
+    if not web_scans:
+        html.append("<div class='card ok'>No web targets scanned.</div>")
     else:
-        html.append("<div class='card'>")
-        html.append(f"<h3>Target: <code>{escape(web_scan.get('base_url',''))}</code></h3>")
-        pages = web_scan.get("pages_crawled", [])
-        html.append("<details><summary class='pill'>Crawled pages</summary>")
-        html.append("<table><thead><tr><th>URL</th><th>Status</th><th>Size</th><th>Error</th></tr></thead><tbody>")
-        for p in pages:
-            html.append(f"<tr><td>{escape(p.get('url',''))}</td><td>{escape(str(p.get('status','')))}</td><td>{escape(str(p.get('size','')))}</td><td class='danger'>{escape(p.get('error',''))}</td></tr>")
-        html.append("</tbody></table></details>")
+        for w in web_scans:
+            k = summarize_web_scan(w)
+            badge = f"bundles:{k['bundles']} • suspicious:{k['suspicious']} • compromised:{k['compromised']} • obfus:{k['obfus_exact']}/{k['obfus_relax']}"
+            html.append("<div class='card'>")
+            html.append(f"<h3>Target: <code>{escape(w.get('base_url',''))}</code> <span class='pill'>{escape(badge)}</span></h3>")
+            pages = w.get("pages_crawled", [])
+            html.append("<details><summary class='pill'>Crawled pages</summary>")
+            html.append("<table><thead><tr><th>URL</th><th>Status</th><th>Size</th><th>Error</th></tr></thead><tbody>")
+            for p in pages:
+                html.append(f"<tr><td>{escape(p.get('url',''))}</td><td>{escape(str(p.get('status','')))}</td><td>{escape(str(p.get('size','')))}</td><td class='danger'>{escape(p.get('error',''))}</td></tr>")
+            html.append("</tbody></table></details>")
 
-        html.append("<details open><summary class='pill'>Analyzed bundles</summary>")
-        html.append("<table><thead><tr><th>URL</th><th>Keywords</th><th>Suspicious</th><th>Version hints</th><th>Compromised</th><th>Obfus. exact</th><th>Obfus. relaxed</th><th>Size</th><th>SHA256</th></tr></thead><tbody>")
-        for j in web_scan.get("js_files", []):
-            if "error" in j:
-                html.append(f"<tr><td>{escape(j.get('url',''))}</td><td colspan='8' class='danger'>Error: {escape(j['error'])}</td></tr>")
-                continue
-            vhint = ", ".join([f"{n}@{v}" for (n, v) in j.get("version_hints", [])]) or "-"
-            badm = ", ".join([f"{n}@{v}" for (n, v) in j.get("bad_version_match", [])]) or "-"
-            html.append("<tr>")
-            html.append(f"<td>{escape(j.get('url',''))}</td>")
-            html.append(f"<td>{escape(', '.join(j.get('keywords', []) ) or '-')}</td>")
-            html.append(f"<td class='warn'>{escape(', '.join(j.get('patterns', []) ) or '-')}</td>")
-            html.append(f"<td>{escape(vhint)}</td>")
-            html.append(f"<td class='danger'>{escape(badm)}</td>")
-            html.append(f"<td>{'✔' if j.get('obfuscation_exact') else '-'}</td>")
-            html.append(f"<td>{'✔' if j.get('obfuscation_relaxed') else '-'}</td>")
-            html.append(f"<td>{escape(str(j.get('size','')))}</td>")
-            html.append(f"<td><code>{escape(j.get('sha256','')[:16])}…</code></td>")
-            html.append("</tr>")
-        html.append("</tbody></table></details>")
-        html.append("</div>")
+            html.append("<details open><summary class='pill'>Analyzed bundles</summary>")
+            html.append("<table><thead><tr><th>URL</th><th>Keywords</th><th>Suspicious</th><th>Version hints</th><th>Compromised</th><th>Obfus. exact</th><th>Obfus. relaxed</th><th>Size</th><th>SHA256</th></tr></thead><tbody>")
+            for j in w.get("js_files", []):
+                if "error" in j:
+                    html.append(f"<tr><td>{escape(j.get('url',''))}</td><td colspan='8' class='danger'>Error: {escape(j['error'])}</td></tr>")
+                    continue
+                vhint = ", ".join([f"{n}@{v}" for (n, v) in j.get("version_hints", [])]) or "-"
+                badm = ", ".join([f"{n}@{v}" for (n, v) in j.get("bad_version_match", [])]) or "-"
+                html.append("<tr>")
+                html.append(f"<td>{escape(j.get('url',''))}</td>")
+                html.append(f"<td>{escape(', '.join(j.get('keywords', []) ) or '-')}</td>")
+                html.append(f"<td class='warn'>{escape(', '.join(j.get('patterns', []) ) or '-')}</td>")
+                html.append(f"<td>{escape(vhint)}</td>")
+                html.append(f"<td class='danger'>{escape(badm)}</td>")
+                html.append(f"<td>{'✔' if j.get('obfuscation_exact') else '-'}</td>")
+                html.append(f"<td>{'✔' if j.get('obfuscation_relaxed') else '-'}</td>")
+                html.append(f"<td>{escape(str(j.get('size','')))}</td>")
+                html.append(f"<td><code>{escape(j.get('sha256','')[:16])}…</code></td>")
+                html.append("</tr>")
+            html.append("</tbody></table></details>")
+            html.append("</div>")
     html.append("</section>")
 
     # Local details
@@ -546,9 +622,16 @@ def build_report(web_scan, local_scan, out_html_path, out_json_path):
 # CLI / Ergonomics
 # ========================
 
-def derive_report_prefix_web(url: str) -> str:
+def derive_report_prefix_web_single(url: str) -> str:
     host = urlparse(url).netloc.split(":")[0] if url else "webhost"
     return f"report_{sanitize_label(host)}__web"
+
+def derive_report_prefix_web_batch(urls: list) -> str:
+    if not urls:
+        return f"report_webbatch"
+    first = urlparse(urls[0]).netloc.split(":")[0] if urls[0] else "webhost"
+    n_more = max(0, len(urls) - 1)
+    return f"report_{sanitize_label(first)}+{n_more}__webbatch"
 
 def derive_report_prefix_local(paths: list) -> str:
     hostname = sanitize_label(socket.gethostname())
@@ -559,39 +642,60 @@ def derive_report_prefix_local(paths: list) -> str:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Supply-chain NPM Scanner (Web OR Local, generates HTML+JSON report)"
+        description="Supply-chain NPM Scanner (Web batch OR Local, generates HTML+JSON report)"
     )
     sub = parser.add_subparsers(dest="mode", required=True)
 
     # Web mode
-    pw = sub.add_parser("web", help="Scan a website (HTTP/HTTPS)")
-    pw.add_argument("--url", required=True, help="Starting URL, e.g. https://example.com/")
-    pw.add_argument("--report-prefix", default=None, help="Prefix for report files (auto if omitted)")
+    pw = sub.add_parser("web", help="Scan websites (single URL, file of URLs, or domain→subdomains)")
+    g = pw.add_mutually_exclusive_group(required=True)
+    g.add_argument("--url", help="Single starting URL, e.g. https://example.com/")
+    g.add_argument("--file", help="Path to a file with one URL per line")
+    g.add_argument("--domain", help="Root domain to enumerate subdomains via crt.sh (e.g., example.com)")
+    pw.add_argument("--scheme", default="https", help="Default scheme when using --domain or raw hosts in --file (default: https)")
+    pw.add_argument("--limit", type=int, default=None, help="Limit number of subdomains (with --domain)")
+    pw.add_argument("--workers", type=int, default=6, help="Parallel workers for web scans")
+    pw.add_argument("--report-prefix", default=None, help="Override report prefix")
 
     # Local mode
     pl = sub.add_parser("local", help="Scan local directories (disks/servers)")
     pl.add_argument("paths", nargs="+", help="Paths to scan (one or more)")
-    pl.add_argument("--report-prefix", default=None, help="Prefix for report files (auto if omitted)")
+    pl.add_argument("--report-prefix", default=None, help="Override report prefix")
 
     args = parser.parse_args()
 
-    # Derive report prefix automatically if not provided
-    if args.mode == "web":
-        auto_prefix = derive_report_prefix_web(args.url)
-    else:
-        auto_prefix = derive_report_prefix_local(args.paths)
-
-    report_prefix = args.report_prefix or auto_prefix
-    ts_tag = timestamp_tag()
-    out_html = os.path.join(REPORTS_DIR, f"{report_prefix}_{ts_tag}.html")
-    out_json = os.path.join(REPORTS_DIR, f"{report_prefix}_{ts_tag}.json")
-
-    web_scan = None
+    ts = timestamp_tag()
+    web_scans = []
     local_scan = None
 
     if args.mode == "web":
-        print(f"[*] Web scan on: {args.url}")
-        web_scan = crawl_and_collect(args.url)
+        targets = []
+        if args.url:
+            targets = [normalize_url(args.url)]
+            prefix = args.report_prefix or derive_report_prefix_web_single(targets[0])
+        elif args.file:
+            raw = [l.strip() for l in read_text(args.file, "").splitlines() if l.strip()]
+            targets = [normalize_url(x, default_scheme=args.scheme) for x in raw]
+            targets = [t for t in targets if t]
+            prefix = args.report_prefix or derive_report_prefix_web_batch(targets)
+        else:  # --domain
+            subs = enumerate_subdomains_crtsh(args.domain, limit=args.limit)
+            # include root domain as well
+            hosts = sorted(set([args.domain] + subs))
+            targets = [normalize_url(h, default_scheme=args.scheme) for h in hosts]
+            prefix = args.report_prefix or derive_report_prefix_web_batch(targets)
+
+        if not targets:
+            print("[!] No web targets to scan.")
+            sys.exit(2)
+
+        print(f"[*] Web targets: {len(targets)} (workers={args.workers})")
+        web_scans = scan_many_web(targets, workers=args.workers)
+        out_html = os.path.join(REPORTS_DIR, f"{prefix}_{ts}.html")
+        out_json = os.path.join(REPORTS_DIR, f"{prefix}_{ts}.json")
+        build_report(web_scans, None, out_html, out_json)
+        print((Fore.CYAN if COLOR else "") + f"[✔] HTML report: {out_html}" + (Style.RESET_ALL if COLOR else ""))
+        print((Fore.CYAN if COLOR else "") + f"[✔] JSON report: {out_json}" + (Style.RESET_ALL if COLOR else ""))
 
     elif args.mode == "local":
         valid = [p for p in args.paths if os.path.exists(p)]
@@ -600,10 +704,12 @@ def main():
             sys.exit(2)
         print(f"[*] Local scan on: {', '.join(valid)}")
         local_scan = scan_local_paths(valid)
-
-    build_report(web_scan, local_scan, out_html, out_json)
-    print(f"[✔] HTML report: {out_html}")
-    print(f"[✔] JSON report: {out_json}")
+        prefix = args.report_prefix or derive_report_prefix_local(valid)
+        out_html = os.path.join(REPORTS_DIR, f"{prefix}_{ts}.html")
+        out_json = os.path.join(REPORTS_DIR, f"{prefix}_{ts}.json")
+        build_report([], local_scan, out_html, out_json)
+        print((Fore.CYAN if COLOR else "") + f"[✔] HTML report: {out_html}" + (Style.RESET_ALL if COLOR else ""))
+        print((Fore.CYAN if COLOR else "") + f"[✔] JSON report: {out_json}" + (Style.RESET_ALL if COLOR else ""))
 
 if __name__ == "__main__":
     main()
