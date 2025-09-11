@@ -42,6 +42,12 @@ Python 3.8+. PyYAML is recommended for PNPM lockfiles.
 dnspython is required for --ns (DNS brute-force).
 
 🚀 Usage
+Powershell script:
+# Scan specific drive
+PowerShell -ExecutionPolicy Bypass -File ".\simple_scanner.ps1" -Path "C:\projets\mon-app" -HtmlReport
+
+# Scan many drives
+PowerShell -ExecutionPolicy Bypass -File ".\simple_scanner.ps1" -Path "C:\Users\nocom\Documents", "D:\projets" -HtmlReport
 1) Web — single URL
 bash
 Copier le code
