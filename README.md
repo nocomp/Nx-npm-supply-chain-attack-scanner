@@ -44,8 +44,9 @@ dnspython is required for --ns (DNS brute-force).
 🚀 Usage
 Powershell script:
 # Scan specific drive
-PowerShell -ExecutionPolicy Bypass -File ".\simple_scanner.ps1" -Path "C:\projets\mon-app" -HtmlReport
-
+PowerShell -ExecutionPolicy Bypass -File .\sccm-scanner.ps1 -Help
+PowerShell -ExecutionPolicy Bypass -File .\sccm-scanner.ps1 local
+PowerShell -ExecutionPolicy Bypass -File .\sccm-scanner.ps1 local -Roots 'C:\','D:\' -MaxDepth 6 -Quiet
 # Scan many drives
 PowerShell -ExecutionPolicy Bypass -File ".\simple_scanner.ps1" -Path "C:\Users\nocom\Documents", "D:\projets" -HtmlReport
 1) Web — single URL
